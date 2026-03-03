@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Xcode user/state
+xcuserdata/
+*.xcuserdatad/
+*.xcuserstate
+
+# Xcode build products
+build/
+DerivedData/
+
+# SwiftPM
+.swiftpm/
+.build/
+
+# Local backups
+iPadNotes/_rollback_backups/
