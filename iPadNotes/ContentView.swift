@@ -435,8 +435,6 @@ private struct NotebookPagesWorkspaceView: View {
     @State private var sharedExportURL: URL?
     @State private var isShowingDiagnosticsShareSheet = false
     @State private var diagnosticsShareURL: URL?
-    // interactionMode = .text → Tt tool active, canvas passive, taps create/edit inline text.
-    // interactionMode = .draw → Pencil draw mode active; media boxes are selectable/manipulable.
     @State private var interactionMode: WorkspaceInteractionMode = .draw
     @State private var selectedInlineSelection: ScopedBoxSelection?
     @State private var selectedMediaSelection: ScopedBoxSelection?
@@ -451,7 +449,6 @@ private struct NotebookPagesWorkspaceView: View {
     @State private var zoomCommandNonce = 0
     @State private var canvasZoomFactorTarget: CGFloat?
     @State private var pageLayoutScale: CGFloat = 1
-    // Shared zoom factor for all pages (1.0 = fit A4 page)
     @State private var sharedPageZoomFactor: CGFloat = 1
     @State private var pinchGestureStartZoomFactor: CGFloat?
     @State private var pinchLastMagnificationValue: CGFloat = 1
@@ -471,7 +468,6 @@ private struct NotebookPagesWorkspaceView: View {
     @State private var pendingSelectionAutoScroll = false
     @State private var activeMediaDragNoteIDs: Set<UUID> = []
     @FocusState private var textBoxFocusedID: UUID?
-    // Hard lock for zoom-out so all page cards stay visually consistent.
     private let lockedMinimumPageLayoutScale: CGFloat = 0.5
     private let nextPagePeekFraction: CGFloat = 0.14
     private let pinchInertiaProjectionDuration: CGFloat = 0.18
@@ -652,10 +648,6 @@ private struct NotebookPagesWorkspaceView: View {
         return "\(notebookPart)-\(pagePart).pdf"
     }
 
-    // MARK: - Page card factory
-    // Extracted from the ForEach body so Swift's type-checker doesn't time out
-    // on the large NotebookScrollPageCard init expression.
-
     @ViewBuilder
     private func pageCard(for note: Note, notebook: Notebook, pageWidth: CGFloat) -> some View {
         let notes = store.visibleNotes
@@ -762,7 +754,7 @@ private struct NotebookPagesWorkspaceView: View {
                 handlePageZoomFactorChange(noteID: note.id, factor: factor)
             }
         )
-.background(
+        .background(
             GeometryReader { proxy in
                 Color.clear
                     .preference(
@@ -772,8 +764,6 @@ private struct NotebookPagesWorkspaceView: View {
             }
         )
     }
-
-    // MARK: - Page card callback helpers
 
     private func handleBeginEditingInlineTextBox(noteID: UUID, boxID: UUID) {
         ignoreTextModePageTapUntil = CACurrentMediaTime() + 0.25
@@ -817,13 +807,10 @@ private struct NotebookPagesWorkspaceView: View {
         applyLinkedZoom(factor)
     }
 
-    /// Handles a media-box frame-change, including cross-page drop detection.
     private func handleMediaBoxFrameChange(noteID: UUID, boxID: UUID, cx: Double, cy: Double, w: Double, h: Double, r: Double) {
         let notes = store.visibleNotes
         guard let idx = notes.firstIndex(where: { $0.id == noteID }) else { return }
         let extents = rotatedHalfExtents(width: w, height: h, rotationDegrees: r)
-        // Transfer only after the visible edge crosses the page by a small amount.
-        // This avoids both early "pop" and the clipped half-on/half-off state.
         let crossPageSlack = 0.035
 
         if cy + extents.vertical > 1.0 + crossPageSlack,
@@ -886,7 +873,6 @@ private struct NotebookPagesWorkspaceView: View {
         targetIsFirstPage: Bool,
         targetIsLastPage: Bool
     ) {
-        // Cross-page drag already controls placement; skip selection scroll snap.
         suppressNextSelectionAutoScroll = true
         store.moveMediaBox(
             boxID: boxID,
@@ -1030,7 +1016,6 @@ private struct NotebookPagesWorkspaceView: View {
                                 || proposed < (1 + zoomBoundaryHysteresis)
                                 || sharedPageZoomFactor < (1 + zoomBoundaryHysteresis)
 
-                            // Use outer gesture primarily for below-fit zooming.
                             if shouldUseOuterBelowFitPath {
                                 isOuterBelowFitGestureActive = true
                                 applyLinkedZoom(proposed)
@@ -1063,7 +1048,6 @@ private struct NotebookPagesWorkspaceView: View {
                             pinchZoomVelocity = 0
                             isOuterBelowFitGestureActive = false
 
-                            // Add a small inertial settle only for below-fit zoom interaction.
                             guard wasOuterBelowFitGestureActive || gestureStartedZoom < 1 || sharedPageZoomFactor < 1 else { return }
                             guard abs(endingVelocity) > 0.03 else { return }
 
@@ -1121,7 +1105,6 @@ private struct NotebookPagesWorkspaceView: View {
                     viewportSize = geometry.size
                     store.selectNotebook(notebook.id)
                     store.searchText = ""
-                    // Prevent stale selection state from previous app sessions.
                     clearInlineTextSelection()
                     clearMediaSelection()
                     interactionMode = .draw
@@ -1202,7 +1185,6 @@ private struct NotebookPagesWorkspaceView: View {
     private func workspaceToolbar(for notebook: Notebook) -> some ToolbarContent {
         ToolbarItemGroup(placement: .topBarLeading) {
 
-            // ── Draw / Pencil ──────────────────────────────────
             Button {
                 enterDrawMode()
             } label: {
@@ -1217,10 +1199,6 @@ private struct NotebookPagesWorkspaceView: View {
             }
             .disabled(store.selectedNote == nil)
 
-            // ── Tt / Text ──────────────────────────────────────
-            // • Off → tap to enter text mode
-            // • On, no box selected → tap again to exit
-            // • On, box selected → tap to open format popover
             Button {
                 if isTextMode {
                     if selectedInlineTextBoxID != nil {
@@ -1246,10 +1224,7 @@ private struct NotebookPagesWorkspaceView: View {
             }
             .disabled(store.selectedNote == nil)
 
-            // ── Insert Image ───────────────────────────────────
-            // Always available when a page is open. Places a new image box.
             Button {
-                // Image/media editing always runs in draw mode.
                 enterDrawMode()
                 isShowingTextBoxImagePicker = true
             } label: {
@@ -1258,7 +1233,6 @@ private struct NotebookPagesWorkspaceView: View {
             .disabled(store.selectedNote == nil)
 
             Button {
-                // Keep scanner destination behavior in draw/media workflow.
                 enterDrawMode()
                 isShowingDocumentScanner = true
             } label: {
@@ -1400,7 +1374,6 @@ private struct NotebookPagesWorkspaceView: View {
             applyLinkedZoom(1, isFitCommand: true, broadcastCommand: true)
             return
         }
-
         applyLinkedZoom(scale, broadcastCommand: true)
     }
 
@@ -1415,21 +1388,18 @@ private struct NotebookPagesWorkspaceView: View {
         sharedPageZoomFactor = clamped
         if clamped < 1 {
             pageLayoutScale = clamped
-            // Keep canvases at fit while outer page frame shrinks.
             canvasZoomFactorTarget = 1
         } else {
             pageLayoutScale = 1
             canvasZoomFactorTarget = isFitCommand ? nil : clamped
         }
 
-        // Reserve explicit command broadcasts for discrete toolbar/menu actions.
         if broadcastCommand {
             zoomCommandNonce += 1
         }
     }
 
     private func synchronizePageZoom(_ scale: CGFloat) {
-        // Kept for compatibility — zoom sync is handled inline via sharedPageZoomFactor
         _ = scale
     }
 
@@ -1453,7 +1423,6 @@ private struct NotebookPagesWorkspaceView: View {
             return lockedMinimumPageLayoutScale
         }
 
-        // Stop zooming out around one full page plus a small peek of the next page.
         let target = viewport.height / (pageHeightAtFit * (1 + nextPagePeekFraction))
         return min(1, max(lockedMinimumPageLayoutScale, target))
     }
@@ -1649,7 +1618,6 @@ private struct NotebookPagesWorkspaceView: View {
             }
         }
         if let lastCreatedBoxID {
-            // Ignore the post-picker/dismiss tap and immediately lock interaction to the new media box.
             ignoreDrawModePageTapUntil = CACurrentMediaTime() + 0.35
             selectMediaBox(noteID: selectedNoteID, boxID: lastCreatedBoxID)
         } else {
@@ -1660,7 +1628,6 @@ private struct NotebookPagesWorkspaceView: View {
     private func encodedImageData(from image: UIImage) -> Data? {
         guard image.size.width > 0, image.size.height > 0 else { return nil }
 
-        // Downsample imported/scanned images to keep overlay interaction smooth.
         let maxDimension: CGFloat = 2200
         let longestSide = max(image.size.width, image.size.height)
         let scale = min(1, maxDimension / max(longestSide, 1))
@@ -1732,8 +1699,6 @@ private struct NotebookPagesWorkspaceView: View {
         return (x: normalizedX, y: normalizedY)
     }
 
-    // ── Mode transitions ──────────────────────────────────────────────────────
-
     private func enterDrawMode() {
         diagnostics.log("mode.change to=draw inlineBefore=\(selectedInlineSelection?.boxID.uuidString ?? "nil") mediaBefore=\(selectedMediaSelection?.boxID.uuidString ?? "nil")")
         interactionMode = .draw
@@ -1779,8 +1744,6 @@ private struct NotebookPagesWorkspaceView: View {
         selectedMediaSelection = nil
     }
 
-    // ── Image import ───────────────────────────────────────────────────────
-
     private func insertPickedImagesOnCurrentPage(_ images: [UIImage]) {
         interactionMode = .draw
         clearInlineTextSelection()
@@ -1820,15 +1783,12 @@ private struct NotebookPagesWorkspaceView: View {
             }
         }
         if let lastCreatedBoxID {
-            // Ignore the post-picker/dismiss tap and immediately lock interaction to the new media box.
             ignoreDrawModePageTapUntil = CACurrentMediaTime() + 0.35
             selectMediaBox(noteID: selectedNoteID, boxID: lastCreatedBoxID)
         } else {
             clearMediaSelection(for: selectedNoteID)
         }
     }
-
-    // ── Format popover content ─────────────────────────────────────────────
 
     private var textFormatPopoverContent: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -2069,7 +2029,7 @@ private struct NotebookPagesWorkspaceView: View {
         let trimmed = cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Page" : trimmed
     }
-    
+
     private func findMainScrollView() -> UIScrollView? {
         func search(_ view: UIView) -> UIScrollView? {
             if let sv = view as? UIScrollView, sv.contentSize.height > sv.bounds.height { return sv }
@@ -2161,7 +2121,6 @@ private struct NotebookScrollPageCard: View {
     let mediaBoxes: [NoteTextBox]
     let selectedInlineTextBoxID: UUID?
     let selectedMediaBoxID: UUID?
-    /// True only for the active page when the Tt tool is on.
     let isTextMode: Bool
     let zoomCommandNonce: Int
     let canvasZoomFactorTarget: CGFloat?
@@ -2182,7 +2141,7 @@ private struct NotebookScrollPageCard: View {
     let onCreateInlineTextBoxAt: (Double, Double) -> UUID?
     let onDeleteInlineTextBox: (UUID) -> Void
     let onDeleteMediaBox: (UUID) -> Void
-    let onCrossPageDrop: (UUID, UUID, Double, Double, Double, Double) -> Void // (boxID, targetNoteID, centerX, centerY, width, height)
+    let onCrossPageDrop: (UUID, UUID, Double, Double, Double, Double) -> Void
     let onRequestIgnorePageTap: () -> Void
     let onRequestIgnoreDrawModePageTap: () -> Void
     let onEdgeScroll: ((CGFloat?) -> Void)?
@@ -2194,106 +2153,107 @@ private struct NotebookScrollPageCard: View {
     let onZoomFactorChange: (CGFloat) -> Void
     @State private var canvasViewportState = CanvasViewportState()
     @State private var lockedViewportState: CanvasViewportState?
-    /// Tracks the specific media box currently driving drag state for this page.
-    /// Non-dragging overlays can emit reset callbacks; ignore those so z-index
-    /// does not drop mid-drag.
     @State private var draggingMediaBoxID: UUID?
 
+    // ── FIX: pageSurface is the base view, overlays are in .overlay{}
+    // so media boxes can overflow page bounds without being clipped.
     var body: some View {
-        ZStack(alignment: .topLeading) {
-            pageSurface
-
-            // Mode-specific page tap catcher — sits behind overlays.
-            // Uses tap only, so drags still pass through to ScrollView.
-            if isTextMode {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .highPriorityGesture(
-                        SpatialTapGesture()
-                            .onEnded { value in handleTextModeTap(at: value.location) }
-                    )
-            } else {
-                Color.clear
-                    .contentShape(Rectangle())
-                    .highPriorityGesture(
-                        SpatialTapGesture()
-                            .onEnded { value in handleDrawModeTap(at: value.location) }
-                    )
+        pageSurface
+            .onChange(of: hasSelectedManipulableBox) { _, selected in
+                if selected {
+                    lockedViewportState = stabilizedViewportState
+                } else {
+                    lockedViewportState = nil
+                }
             }
-
-            ForEach(orderedMediaBoxes) { box in
-                PageMediaBoxOverlay(
-                    box: box,
-                    isSelected: box.id == selectedMediaBoxID,
-                    isFirstPage: isFirstPage,
-                    isLastPage: isLastPage,
-                    isTextMode: isTextMode,
-                    viewportState: effectiveViewportState,
-                    onTapAtLocation: { location in
-                        handleDrawModeTap(at: location)
-                    },
-                    onDelete: {
-                        onRequestIgnoreDrawModePageTap()
-                        onDeleteMediaBox(box.id)
-                    },
-                    onRequestIgnorePageTap: onRequestIgnoreDrawModePageTap,
-                    onFrameChange: { cx, cy, w, h, r in
-                        onMediaBoxFrameChange(box.id, cx, cy, w, h, r)
-                    },
-                    onDragActiveChanged: { active in
-                        if active {
-                            guard draggingMediaBoxID != box.id else { return }
-                            let wasDragging = draggingMediaBoxID != nil
-                            draggingMediaBoxID = box.id
-                            if !wasDragging {
-                                onMediaDragActiveChanged?(true)
-                            }
-                        } else {
-                            guard draggingMediaBoxID == box.id else { return }
-                            draggingMediaBoxID = nil
-                            onMediaDragActiveChanged?(false)
-                        }
-                    },
-                    onEdgeScroll: onEdgeScroll
-                )
-            }
-
-            ForEach(inlineTextBoxes) { box in
-                PageInlineTextOverlay(
-                    box: box,
-                    isSelected: box.id == selectedInlineTextBoxID,
-                    isTextMode: isTextMode,
-                    viewportState: effectiveViewportState,
-                    pageLayoutScale: pageLayoutScale,
-                    searchQuery: searchQuery,
-                    searchHighlights: searchHighlights(for: box.id),
-                    onBeginEditing: { onBeginEditingInlineTextBox(box.id) },
-                    onTextChange: { text in onInlineTextBoxTextChange(box.id, text) },
-                    onStyleChange: { style in onInlineTextBoxStyleChange(box.id, style) },
-                    onDelete: {
-                        onRequestIgnorePageTap()
-                        onDeleteInlineTextBox(box.id)
-                    },
-                    onRequestIgnorePageTap: onRequestIgnorePageTap,
-                    onFrameChange: { cx, cy, w, h, r in
-                        onInlineTextBoxFrameChange(box.id, cx, cy, w, h, r)
+            .frame(width: pageWidth, height: pageHeight)
+            .frame(maxWidth: .infinity, alignment: .center)
+            .contentShape(Rectangle())
+            .overlay(alignment: .topLeading) {
+                ZStack(alignment: .topLeading) {
+                    // Mode-specific page tap catcher — sits behind overlays.
+                    // Uses tap only, so drags still pass through to ScrollView.
+                    if isTextMode {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .highPriorityGesture(
+                                SpatialTapGesture()
+                                    .onEnded { value in handleTextModeTap(at: value.location) }
+                            )
+                    } else {
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .highPriorityGesture(
+                                SpatialTapGesture()
+                                    .onEnded { value in handleDrawModeTap(at: value.location) }
+                            )
                     }
-                )
+
+                    ForEach(orderedMediaBoxes) { box in
+                        PageMediaBoxOverlay(
+                            box: box,
+                            isSelected: box.id == selectedMediaBoxID,
+                            isFirstPage: isFirstPage,
+                            isLastPage: isLastPage,
+                            isTextMode: isTextMode,
+                            viewportState: effectiveViewportState,
+                            onTapAtLocation: { location in
+                                handleDrawModeTap(at: location)
+                            },
+                            onDelete: {
+                                onRequestIgnoreDrawModePageTap()
+                                onDeleteMediaBox(box.id)
+                            },
+                            onRequestIgnorePageTap: onRequestIgnoreDrawModePageTap,
+                            onFrameChange: { cx, cy, w, h, r in
+                                onMediaBoxFrameChange(box.id, cx, cy, w, h, r)
+                            },
+                            onDragActiveChanged: { active in
+                                if active {
+                                    guard draggingMediaBoxID != box.id else { return }
+                                    let wasDragging = draggingMediaBoxID != nil
+                                    draggingMediaBoxID = box.id
+                                    if !wasDragging {
+                                        onMediaDragActiveChanged?(true)
+                                    }
+                                } else {
+                                    guard draggingMediaBoxID == box.id else { return }
+                                    draggingMediaBoxID = nil
+                                    onMediaDragActiveChanged?(false)
+                                }
+                            },
+                            onEdgeScroll: onEdgeScroll
+                        )
+                    }
+
+                    ForEach(inlineTextBoxes) { box in
+                        PageInlineTextOverlay(
+                            box: box,
+                            isSelected: box.id == selectedInlineTextBoxID,
+                            isTextMode: isTextMode,
+                            viewportState: effectiveViewportState,
+                            pageLayoutScale: pageLayoutScale,
+                            searchQuery: searchQuery,
+                            searchHighlights: searchHighlights(for: box.id),
+                            onBeginEditing: { onBeginEditingInlineTextBox(box.id) },
+                            onTextChange: { text in onInlineTextBoxTextChange(box.id, text) },
+                            onStyleChange: { style in onInlineTextBoxStyleChange(box.id, style) },
+                            onDelete: {
+                                onRequestIgnorePageTap()
+                                onDeleteInlineTextBox(box.id)
+                            },
+                            onRequestIgnorePageTap: onRequestIgnorePageTap,
+                            onFrameChange: { cx, cy, w, h, r in
+                                onInlineTextBoxFrameChange(box.id, cx, cy, w, h, r)
+                            }
+                        )
+                    }
+                }
+                .frame(width: pageWidth, height: pageHeight)
             }
-        }
-        .onChange(of: hasSelectedManipulableBox) { _, selected in
-            if selected {
-                lockedViewportState = stabilizedViewportState
-            } else {
-                lockedViewportState = nil
-            }
-        }
-        .frame(width: pageWidth, height: pageHeight)
-        .frame(maxWidth: .infinity, alignment: .center)
-        .contentShape(Rectangle())
-        // Dragging must always win stacking over any merely-selected page.
-        // This prevents the dragged image from slipping under the adjacent page.
-        .zIndex(draggingMediaBoxID != nil ? 3000 : ((selectedMediaBoxID != nil || selectedMediaOverflowsPageBounds) ? 1000 : 0))
+            // Dragging must always win stacking over any merely-selected page.
+            // This prevents the dragged image from slipping under the adjacent page.
+            .zIndex(draggingMediaBoxID != nil ? 3000 : ((selectedMediaBoxID != nil || selectedMediaOverflowsPageBounds) ? 1000 : 0))
     }
 
     private var pageSurface: some View {
@@ -2303,7 +2263,6 @@ private struct NotebookScrollPageCard: View {
             backgroundImageData: note.backgroundImageData,
             drawingData: note.drawingData,
             isActive: isActive,
-            // Canvas is interactive (draws with Pencil) only when text mode is OFF.
             isCanvasToolingEnabled: isActive && !isTextMode && !hasSelectedManipulableBox,
             isViewportGesturesEnabled: !hasSelectedManipulableBox,
             zoomCommandNonce: zoomCommandNonce,
@@ -2311,8 +2270,6 @@ private struct NotebookScrollPageCard: View {
             sharedZoomFactor: sharedZoomFactor,
             onZoomFactorChange: onZoomFactorChange,
             onViewportStateChange: { viewport in
-                // Keep viewport fixed while a media box is selected so box drag
-                // does not jitter from competing background viewport updates.
                 if hasSelectedManipulableBox {
                     if lockedViewportState == nil {
                         lockedViewportState = stabilizedViewportState
@@ -2357,8 +2314,6 @@ private struct NotebookScrollPageCard: View {
     private var stabilizedViewportState: CanvasViewportState {
         var state = canvasViewportState
         if state.zoomFactor <= 1.001 {
-            // Keep the fitted-page origin from UIScrollView centering logic.
-            // Zeroing origin here shifts overlay hit-testing/selection while at fit zoom.
             if abs(state.contentOffset.x) < 0.5 { state.contentOffset.x = 0 }
             if abs(state.contentOffset.y) < 0.5 { state.contentOffset.y = 0 }
             return state
@@ -2380,7 +2335,6 @@ private struct NotebookScrollPageCard: View {
         guard let selected = mediaBoxes.first(where: { $0.id == selectedMediaBoxID }) else {
             return mediaBoxes
         }
-        // Keep selected media on top so touch ownership stays intuitive with overlaps.
         return unselected + [selected]
     }
 
@@ -2391,7 +2345,6 @@ private struct NotebookScrollPageCard: View {
             "draw.tap note=\(note.id.uuidString) point=(\(Int(location.x)),\(Int(location.y))) selectedMedia=\(selectedMediaBoxID?.uuidString ?? "nil")"
         )
 
-        // Check if tap hit the delete button on the selected media box.
         if let selectedID = selectedMediaBoxID,
            let selectedBox = orderedMediaBoxes.first(where: { $0.id == selectedID }) {
             let boxRect = screenRect(for: selectedBox)
@@ -2423,8 +2376,6 @@ private struct NotebookScrollPageCard: View {
     private func drawModeSelectionAction(for location: CGPoint) -> DrawModeSelectionAction {
         let hits = mediaHitBoxes(at: location)
         if let selectedID = selectedMediaBoxID {
-            // If multiple boxes overlap, allow switching by preferring the first
-            // hit that is not currently selected.
             if let other = hits.first(where: { $0.id != selectedID }) {
                 return .select(other.id)
             }
@@ -2484,13 +2435,11 @@ private struct NotebookScrollPageCard: View {
         }
     }
 
-    // Handles a tap on the page canvas while the text tool is active.
     private func handleTextModeTap(at location: CGPoint) {
         store.selectPage(note.id)
         guard CACurrentMediaTime() >= ignorePageTapUntil else { return }
         TextBoxDiagnosticsLogger.shared.log("text.tap note=\(note.id.uuidString) point=(\(Int(location.x)),\(Int(location.y))) selectedInline=\(selectedInlineTextBoxID?.uuidString ?? "nil")")
 
-        // Hit-test text boxes.
         if let hit = inlineTextBoxes.reversed().first(where: {
             $0.contentType == .text && hitTest(point: location, box: $0)
         }) {
@@ -2499,9 +2448,6 @@ private struct NotebookScrollPageCard: View {
             return
         }
 
-        // Tap on blank canvas:
-        // - settle current selection (delete if empty)
-        // - if nothing is selected, create a new editable text box at tap location
         let pt = normalizedPoint(for: location)
         if let currentBoxID = selectedInlineTextBoxID {
             if let currentBox = inlineTextBoxes.first(where: { $0.id == currentBoxID }) {
@@ -2632,7 +2578,6 @@ private struct PageInlineTextOverlay: View {
     var body: some View {
         GeometryReader { proxy in
             let pageSize = proxy.size
-            let pageGlobalFrame = proxy.frame(in: .global)
             let currentFrame = transientFrame ?? modelFrame
             let boxFrame = frame(for: currentFrame, in: pageSize)
 
@@ -3228,7 +3173,6 @@ private struct PageMediaBoxOverlay: View {
             .onChange(of: box.contentType) { _, _ in
                 refreshDecodedOverlayImage()
             }
-            // AFTER:
             .onChange(of: isSelected) { _, selected in
                 if selected {
                     transientFrame = nil
@@ -3239,8 +3183,6 @@ private struct PageMediaBoxOverlay: View {
                     isPinchResizing = false
                     isRotatingBox = false
                 } else {
-                    // Only reset if we're not mid-drag (cross-page transfer deselects
-                    // the source while the gesture is still alive on this view).
                     if !isDraggingBox {
                         resetInteractionState()
                     }
@@ -3327,7 +3269,6 @@ private struct PageMediaBoxOverlay: View {
                     let start = transientFrame ?? modelFrame
                     dragStartFrame = start
                     transientFrame = start
-                    // Keep touch anchoring in global coordinates to avoid jumps.
                     dragTouchOffset = CGSize(
                         width: value.startLocation.x - (pageGlobalFrame.minX + boxFrame.midX),
                         height: value.startLocation.y - (pageGlobalFrame.minY + boxFrame.midY)
@@ -3366,7 +3307,6 @@ private struct PageMediaBoxOverlay: View {
                     )
                     transientFrame = finalFrame
                 }
-                // AFTER:
                 if movedEnough && (isDraggingBox || dragStartFrame != nil) {
                     commitTransientFrameIfNeeded()
                     onRequestIgnorePageTap()
@@ -3863,7 +3803,7 @@ private struct PhotoLibraryPickerSheet: UIViewControllerRepresentable {
     func makeUIViewController(context: Context) -> PHPickerViewController {
         var configuration = PHPickerConfiguration(photoLibrary: .shared())
         configuration.filter = .images
-        configuration.selectionLimit = 0 // Unlimited multi-select.
+        configuration.selectionLimit = 0
         configuration.preferredAssetRepresentationMode = .current
         let picker = PHPickerViewController(configuration: configuration)
         picker.delegate = context.coordinator
@@ -4166,8 +4106,8 @@ private struct ZoomablePaperCanvasPageRepresentable: UIViewRepresentable {
     let isCanvasToolingEnabled: Bool
     let isViewportGesturesEnabled: Bool
     let zoomCommandNonce: Int
-    let zoomFactorTarget: CGFloat?  // kept for toolbar commands (nonce-driven)
-    let sharedZoomFactor: CGFloat   // live-synced zoom factor for all pages
+    let zoomFactorTarget: CGFloat?
+    let sharedZoomFactor: CGFloat
     let onZoomFactorChange: (CGFloat) -> Void
     let onViewportStateChange: (CanvasViewportState) -> Void
     let onInteraction: () -> Void
@@ -4231,7 +4171,6 @@ private struct ZoomablePaperCanvasPageRepresentable: UIViewRepresentable {
         uiView.setCanvasActive(isCanvasToolingEnabled)
         uiView.setViewportGesturesEnabled(isViewportGesturesEnabled)
 
-        // Toolbar command takes priority (nonce changed)
         if context.coordinator.lastAppliedZoomCommandNonce != zoomCommandNonce {
             if let zoomFactorTarget {
                 uiView.setZoomFactor(zoomFactorTarget, animated: false)
@@ -4241,7 +4180,6 @@ private struct ZoomablePaperCanvasPageRepresentable: UIViewRepresentable {
             context.coordinator.lastAppliedZoomCommandNonce = zoomCommandNonce
             context.coordinator.lastAppliedZoomFactor = sharedZoomFactor
         } else if abs(uiView.currentZoomFactor - sharedZoomFactor) > 0.001 {
-            // Always reconcile page zoom to the shared value to avoid per-page drift.
             uiView.setZoomFactor(sharedZoomFactor, animated: false)
             context.coordinator.lastAppliedZoomFactor = sharedZoomFactor
         }
@@ -4368,7 +4306,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
         scrollView.showsHorizontalScrollIndicator = false
         scrollView.contentInsetAdjustmentBehavior = .never
         scrollView.panGestureRecognizer.minimumNumberOfTouches = 1
-        // Keep Apple Pencil dedicated to drawing; scrolling should come from finger touch.
         scrollView.panGestureRecognizer.allowedTouchTypes = [
             NSNumber(value: UITouch.TouchType.direct.rawValue)
         ]
@@ -4403,11 +4340,9 @@ private final class ZoomablePaperCanvasHostView: UIView {
         contentView.addSubview(backgroundImageView)
         contentView.addSubview(canvasView)
 
-        // Start with outer notebook scroll handling one-finger pans. Enable page panning only after zooming in.
         updateViewportGestureAvailability()
     }
 
-    // Standard A4 at 96 dpi: 794 × 1123 pt
     static let a4Size = CGSize(width: 794, height: 1123)
 
     override func layoutSubviews() {
@@ -4416,14 +4351,12 @@ private final class ZoomablePaperCanvasHostView: UIView {
         let a4 = Self.a4Size
         scrollView.frame = bounds
 
-        // Content is always A4 — never changes size
         contentView.frame = CGRect(origin: .zero, size: a4)
         paperView.frame = CGRect(origin: .zero, size: a4)
         backgroundImageView.frame = CGRect(origin: .zero, size: a4)
         canvasView.frame = CGRect(origin: .zero, size: a4)
         scrollView.contentSize = a4
 
-        // Compute minimumZoomScale so the full A4 page fits inside the scroll view
         guard bounds.width > 0, bounds.height > 0 else { return }
         let scaleX = bounds.width / a4.width
         let scaleY = bounds.height / a4.height
@@ -4446,7 +4379,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
     }
 
     func resetZoomToOverview(animated: Bool) {
-        // Overview = fit-to-page (minimumZoomScale), since the page is now a fixed A4 size
         setZoomFactor(1, animated: animated)
     }
 
@@ -4528,8 +4460,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
         if isCanvasActive {
             toolPicker.setVisible(true, forFirstResponder: canvasView)
             canvasView.becomeFirstResponder()
-            // Re-assert first responder after modal transitions (PDF picker/scanner)
-            // where UIKit may silently drop responder status.
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isCanvasActive else { return }
                 self.toolPicker?.setVisible(true, forFirstResponder: self.canvasView)
@@ -4558,17 +4488,14 @@ private final class ZoomablePaperCanvasHostView: UIView {
 
     private func centerContentIfNeeded() {
         let scrollBounds = scrollView.bounds.size
-        // The scaled size of the A4 content
         let scaledWidth = Self.a4Size.width * scrollView.zoomScale
         let scaledHeight = Self.a4Size.height * scrollView.zoomScale
         var frame = contentView.frame
 
-        // Center horizontally if content is narrower than viewport
         frame.origin.x = scaledWidth < scrollBounds.width
             ? (scrollBounds.width - scaledWidth) / 2
             : 0
 
-        // Center vertically when zoomed out.
         frame.origin.y = scaledHeight < scrollBounds.height
             ? (scrollBounds.height - scaledHeight) / 2
             : 0
@@ -4588,7 +4515,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
     }
 
     private func lockVerticalOffsetForOverviewAndBelow() {
-        // At or below minimumZoomScale the page fits in full — no scrolling needed
         guard scrollView.zoomScale <= scrollView.minimumZoomScale + 0.005 else { return }
         if abs(scrollView.contentOffset.y) > 0.5 {
             scrollView.contentOffset.y = 0
@@ -4596,7 +4522,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
     }
 
     private func lockHorizontalOffsetForOverviewAndBelow() {
-        // At or below minimumZoomScale the page should not drift horizontally.
         guard scrollView.zoomScale <= scrollView.minimumZoomScale + 0.005 else { return }
         if abs(scrollView.contentOffset.x) > 0.5 {
             scrollView.contentOffset.x = 0
@@ -4649,8 +4574,6 @@ private final class ZoomablePaperCanvasHostView: UIView {
             hostView.lockVerticalOffsetForOverviewAndBelow()
             hostView.publishViewportState()
             guard !hostView.isApplyingProgrammaticZoom else { return }
-
-            // Broadcast normalized zoom factor relative to A4 fit scale.
             hostView.onZoomFactorChanged?(normalizedFactor)
         }
 
