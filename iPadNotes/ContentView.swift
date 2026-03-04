@@ -458,6 +458,7 @@ private struct NotebookPagesWorkspaceView: View {
     @State private var viewportSize: CGSize = .zero
     @State private var autoScrollTimer: Timer?
     @State private var dragEdgeY: CGFloat? = nil
+    @State private var notebookScrollView: UIScrollView?
     @State private var pageViewportStates: [UUID: CanvasViewportState] = [:]
     @State private var currentViewedNoteID: UUID?
     @State private var pageSearchMatches: [PageSearchMatch] = []
@@ -981,15 +982,15 @@ private struct NotebookPagesWorkspaceView: View {
         GeometryReader { geometry in
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(alignment: .center, spacing: 0) {
-                        ForEach(store.visibleNotes) { note in
-                            pageCard(for: note, notebook: notebook, pageWidth: max(1, geometry.size.width * pageLayoutScale))
-                                .id(note.id)
+                    notebookScrollContent(notebook: notebook, geometry: geometry)
+                }
+                .background(
+                    ScrollViewResolver { resolved in
+                        if notebookScrollView !== resolved {
+                            notebookScrollView = resolved
                         }
                     }
-                    .frame(maxWidth: .infinity)
-                    .frame(minHeight: geometry.size.height, alignment: pageLayoutScale < 1 ? .center : .top)
-                }
+                )
                 .scrollDisabled(shouldLockPageScrollForBoxManipulation)
                 .coordinateSpace(name: "notebookScroll")
                 .onPreferenceChange(VisiblePageFramePreferenceKey.self) { frames in
@@ -1178,6 +1179,105 @@ private struct NotebookPagesWorkspaceView: View {
                     )
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func notebookScrollContent(notebook: Notebook, geometry: GeometryProxy) -> some View {
+        let pageWidth = max(1, geometry.size.width * pageLayoutScale)
+        let pageHeight = pageWidth * (1123.0 / 794.0)
+        let notes = store.visibleNotes
+
+        ZStack(alignment: .top) {
+            notebookPageCards(notes: notes, notebook: notebook, pageWidth: pageWidth)
+            notebookUnifiedMediaLayer(notes: notes, pageWidth: pageWidth, pageHeight: pageHeight)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(minHeight: geometry.size.height, alignment: pageLayoutScale < 1 ? .center : .top)
+    }
+
+    @ViewBuilder
+    private func notebookPageCards(notes: [Note], notebook: Notebook, pageWidth: CGFloat) -> some View {
+        // Page canvases — each owns its PencilKit canvas and tap handling.
+        LazyVStack(alignment: .center, spacing: 0) {
+            ForEach(notes) { note in
+                pageCard(for: note, notebook: notebook, pageWidth: pageWidth)
+                    .id(note.id)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func notebookUnifiedMediaLayer(notes: [Note], pageWidth: CGFloat, pageHeight: CGFloat) -> some View {
+        // Single unified media box layer spanning ALL pages.
+        // Lives outside per-page frames so images never clip at boundaries.
+        let totalHeight = pageHeight * CGFloat(notes.count)
+        ZStack(alignment: .topLeading) {
+            ForEach(Array(notes.enumerated()), id: \.element.id) { idx, note in
+                notebookUnifiedMediaOverlays(
+                    note: note,
+                    noteIndex: idx,
+                    allNotes: notes,
+                    pageWidth: pageWidth,
+                    pageHeight: pageHeight
+                )
+            }
+        }
+        .frame(width: pageWidth, height: totalHeight, alignment: .topLeading)
+        .coordinateSpace(name: "unifiedMediaLayer")
+        .allowsHitTesting(!isTextMode)
+    }
+
+    @ViewBuilder
+    private func notebookUnifiedMediaOverlays(
+        note: Note,
+        noteIndex: Int,
+        allNotes: [Note],
+        pageWidth: CGFloat,
+        pageHeight: CGFloat
+    ) -> some View {
+        let pageOffsetY = pageHeight * CGFloat(noteIndex)
+        ForEach(orderedMediaBoxesForUnifiedLayer(note: note)) { box in
+            PageMediaBoxOverlay(
+                box: box,
+                isSelected: box.id == selectedMediaBoxID(for: note.id),
+                isFirstPage: noteIndex == 0,
+                isLastPage: noteIndex == allNotes.indices.last,
+                isTextMode: isTextMode && note.id == store.selectedNoteID,
+                viewportState: pageViewportStates[note.id] ?? CanvasViewportState(),
+                pageWidth: pageWidth,
+                pageHeight: pageHeight,
+                pageOffsetY: pageOffsetY,
+                onTapAtLocation: { location in
+                    store.selectPage(note.id)
+                    handleDrawModeTapFromUnifiedLayer(noteID: note.id, at: location)
+                },
+                onDelete: {
+                    ignoreDrawModePageTapUntil = CACurrentMediaTime() + 0.06
+                    handleDeleteMediaBox(noteID: note.id, boxID: box.id)
+                },
+                onRequestIgnorePageTap: {
+                    ignoreDrawModePageTapUntil = CACurrentMediaTime() + 0.06
+                },
+                onFrameChange: { cx, cy, w, h, r in
+                    handleMediaBoxFrameChange(noteID: note.id, boxID: box.id, cx: cx, cy: cy, w: w, h: h, r: r)
+                },
+                onDragActiveChanged: { active in
+                    if active {
+                        activeMediaDragNoteIDs.insert(note.id)
+                        store.selectPage(note.id)
+                        selectMediaBox(noteID: note.id, boxID: box.id)
+                    } else {
+                        activeMediaDragNoteIDs.remove(note.id)
+                    }
+                },
+                onEdgeScroll: { y in
+                    startAutoScrollIfNeeded(globalY: y)
+                },
+                scrollOffsetY: {
+                    notebookScrollView?.contentOffset.y ?? 0
+                }
+            )
         }
     }
 
@@ -2023,6 +2123,25 @@ private struct NotebookPagesWorkspaceView: View {
         return image.jpegData(compressionQuality: 0.92)
     }
 
+    private func orderedMediaBoxesForUnifiedLayer(note: Note) -> [NoteTextBox] {
+        let boxes = note.mediaBoxes.filter { $0.contentType == .image || $0.isContainerStyle }
+        guard let selectedID = selectedMediaBoxID(for: note.id) else { return boxes }
+        let unselected = boxes.filter { $0.id != selectedID }
+        guard let selected = boxes.first(where: { $0.id == selectedID }) else { return boxes }
+        return unselected + [selected]
+    }
+
+    private func handleDrawModeTapFromUnifiedLayer(noteID: UUID, at location: CGPoint) {
+        guard CACurrentMediaTime() >= ignoreDrawModePageTapUntil else { return }
+        if let selectedID = selectedMediaBoxID(for: noteID) {
+            clearMediaSelection(for: noteID)
+            _ = selectedID
+            return
+        }
+        // Nothing hit — deselect
+        clearMediaSelection()
+    }
+
     private func sanitizeFilename(_ raw: String) -> String {
         let invalid = CharacterSet(charactersIn: "/\\:?*\"<>|")
         let cleaned = raw.components(separatedBy: invalid).joined(separator: "-")
@@ -2031,14 +2150,27 @@ private struct NotebookPagesWorkspaceView: View {
     }
 
     private func findMainScrollView() -> UIScrollView? {
-        func search(_ view: UIView) -> UIScrollView? {
-            if let sv = view as? UIScrollView, sv.contentSize.height > sv.bounds.height { return sv }
-            for sub in view.subviews { if let f = search(sub) { return f } }
+        func collect(_ view: UIView, into bag: inout [UIScrollView]) {
+            if let sv = view as? UIScrollView,
+               sv.contentSize.height > sv.bounds.height + 1 {
+                bag.append(sv)
+            }
+            for sub in view.subviews {
+                collect(sub, into: &bag)
+            }
+        }
+        guard let root = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene }).first?
+            .windows.first else {
             return nil
         }
-        return UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }.first?.windows.first
-            .flatMap { search($0) }
+        var candidates: [UIScrollView] = []
+        collect(root, into: &candidates)
+        return candidates.max(by: {
+            let lhsExtent = max(0, $0.contentSize.height - $0.bounds.height)
+            let rhsExtent = max(0, $1.contentSize.height - $1.bounds.height)
+            return lhsExtent < rhsExtent
+        })
     }
 
     private func startAutoScrollIfNeeded(globalY: CGFloat?) {
@@ -2050,23 +2182,30 @@ private struct NotebookPagesWorkspaceView: View {
         }
         guard autoScrollTimer == nil else { return }
         autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { _ in
-            guard let y = dragEdgeY, let sv = findMainScrollView() else { return }
-            let screenH = viewportSize.height
-            let triggerZone = screenH * 0.22
+            guard let contentY = dragEdgeY else { return }
+            guard let sv = notebookScrollView ?? findMainScrollView() else { return }
+            // Drag gesture reports Y in scroll-content coordinates.
+            // Convert to viewport coordinates so edge thresholds remain stable.
+            let y = contentY - sv.contentOffset.y
+            let viewportH = max(sv.bounds.height, 1)
+            let triggerZone = viewportH * 0.22
             var speed: CGFloat = 0
-            if y > screenH - triggerZone {
-                let t = (y - (screenH - triggerZone)) / triggerZone
+            if y > viewportH - triggerZone {
+                let rawT = (y - (viewportH - triggerZone)) / triggerZone
+                let t = min(max(rawT, 0), 1)
                 speed = t * t * 20
             } else if y < triggerZone {
-                let t = (triggerZone - y) / triggerZone
+                let rawT = (triggerZone - y) / triggerZone
+                let t = min(max(rawT, 0), 1)
                 speed = -(t * t * 20)
             }
             guard abs(speed) > 0.1 else { return }
             let maxY = max(0, sv.contentSize.height - sv.bounds.height)
-            sv.setContentOffset(
-                CGPoint(x: sv.contentOffset.x, y: min(max(sv.contentOffset.y + speed, 0), maxY)),
-                animated: false
-            )
+            let newOffset = CGPoint(x: sv.contentOffset.x, y: min(max(sv.contentOffset.y + speed, 0), maxY))
+            let wasEnabled = sv.isScrollEnabled
+            if !wasEnabled { sv.isScrollEnabled = true }
+            sv.setContentOffset(newOffset, animated: false)
+            if !wasEnabled { sv.isScrollEnabled = false }
         }
     }
 }
@@ -2076,6 +2215,52 @@ private enum PageInkTool: Hashable {
     case pencil
     case marker
     case eraser
+}
+
+private struct ScrollViewResolver: UIViewRepresentable {
+    let onResolve: (UIScrollView) -> Void
+
+    func makeUIView(context: Context) -> ResolverView {
+        let view = ResolverView()
+        view.onResolve = onResolve
+        return view
+    }
+
+    func updateUIView(_ uiView: ResolverView, context: Context) {
+        uiView.onResolve = onResolve
+        uiView.resolveIfNeeded()
+    }
+
+    final class ResolverView: UIView {
+        var onResolve: ((UIScrollView) -> Void)?
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            resolveIfNeeded()
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            resolveIfNeeded()
+        }
+
+        override func layoutSubviews() {
+            super.layoutSubviews()
+            resolveIfNeeded()
+        }
+
+        func resolveIfNeeded() {
+            guard let onResolve else { return }
+            var parent = superview
+            while let view = parent {
+                if let scroll = view as? UIScrollView {
+                    onResolve(scroll)
+                    return
+                }
+                parent = view.superview
+            }
+        }
+    }
 }
 
 private struct CanvasViewportState: Equatable {
@@ -2155,9 +2340,9 @@ private struct NotebookScrollPageCard: View {
     @State private var lockedViewportState: CanvasViewportState?
     @State private var draggingMediaBoxID: UUID?
 
-    // ── FIX: pageSurface is the base view, overlays are in .overlay{}
-    // so media boxes can overflow page bounds without being clipped.
     var body: some View {
+        // Media boxes are rendered in the unified scroll-layer overlay above.
+        // This view only handles: canvas drawing, tap detection, inline text boxes.
         pageSurface
             .onChange(of: hasSelectedManipulableBox) { _, selected in
                 if selected {
@@ -2167,12 +2352,9 @@ private struct NotebookScrollPageCard: View {
                 }
             }
             .frame(width: pageWidth, height: pageHeight)
-            .frame(maxWidth: .infinity, alignment: .center)
-            .contentShape(Rectangle())
             .overlay(alignment: .topLeading) {
                 ZStack(alignment: .topLeading) {
-                    // Mode-specific page tap catcher — sits behind overlays.
-                    // Uses tap only, so drags still pass through to ScrollView.
+                    // Tap catcher — draw or text mode
                     if isTextMode {
                         Color.clear
                             .contentShape(Rectangle())
@@ -2189,43 +2371,7 @@ private struct NotebookScrollPageCard: View {
                             )
                     }
 
-                    ForEach(orderedMediaBoxes) { box in
-                        PageMediaBoxOverlay(
-                            box: box,
-                            isSelected: box.id == selectedMediaBoxID,
-                            isFirstPage: isFirstPage,
-                            isLastPage: isLastPage,
-                            isTextMode: isTextMode,
-                            viewportState: effectiveViewportState,
-                            onTapAtLocation: { location in
-                                handleDrawModeTap(at: location)
-                            },
-                            onDelete: {
-                                onRequestIgnoreDrawModePageTap()
-                                onDeleteMediaBox(box.id)
-                            },
-                            onRequestIgnorePageTap: onRequestIgnoreDrawModePageTap,
-                            onFrameChange: { cx, cy, w, h, r in
-                                onMediaBoxFrameChange(box.id, cx, cy, w, h, r)
-                            },
-                            onDragActiveChanged: { active in
-                                if active {
-                                    guard draggingMediaBoxID != box.id else { return }
-                                    let wasDragging = draggingMediaBoxID != nil
-                                    draggingMediaBoxID = box.id
-                                    if !wasDragging {
-                                        onMediaDragActiveChanged?(true)
-                                    }
-                                } else {
-                                    guard draggingMediaBoxID == box.id else { return }
-                                    draggingMediaBoxID = nil
-                                    onMediaDragActiveChanged?(false)
-                                }
-                            },
-                            onEdgeScroll: onEdgeScroll
-                        )
-                    }
-
+                    // Inline text boxes (these stay per-page, they don't need cross-page rendering)
                     ForEach(inlineTextBoxes) { box in
                         PageInlineTextOverlay(
                             box: box,
@@ -2251,9 +2397,8 @@ private struct NotebookScrollPageCard: View {
                 }
                 .frame(width: pageWidth, height: pageHeight)
             }
-            // Dragging must always win stacking over any merely-selected page.
-            // This prevents the dragged image from slipping under the adjacent page.
-            .zIndex(draggingMediaBoxID != nil ? 3000 : ((selectedMediaBoxID != nil || selectedMediaOverflowsPageBounds) ? 1000 : 0))
+            .frame(maxWidth: .infinity, alignment: .center)
+            .contentShape(Rectangle())
     }
 
     private var pageSurface: some View {
@@ -2604,6 +2749,7 @@ private struct PageInlineTextOverlay: View {
                         guard isEditing else { return }
                         requestKeyboardFocus()
                     }
+
                     .onChange(of: isSelected) { _, selected in
                         TextBoxDiagnosticsLogger.shared.log("inline.selection box=\(box.id.uuidString) selected=\(selected ? "true" : "false") mode=\(isTextMode ? "text" : "draw")")
                         if selected {
@@ -2657,6 +2803,13 @@ private struct PageInlineTextOverlay: View {
                     }
                     .allowsHitTesting(isTextMode)
 
+                // Drag handle lives as a ZStack sibling — completely outside the TextEditor's
+                // UIKit view hierarchy so UITextView's pan gesture cannot intercept it.
+                if isEditing {
+                    dragHandle(pageSize: pageSize, boxFrame: boxFrame)
+                        .zIndex(3)
+                }
+
                 if showsDeleteControl {
                     deleteButton
                         .position(x: boxFrame.maxX + 10, y: boxFrame.minY - 10)
@@ -2685,7 +2838,9 @@ private struct PageInlineTextOverlay: View {
             .scrollContentBackground(.hidden)
             .background(Color.clear)
             .focused($isFocused)
-            .padding(scaledTextInset)
+            // Top padding pushes text below the drag handle overlay
+            .padding(.top, max(20, 18 * effectiveTextScale))
+            .padding([.leading, .trailing, .bottom], scaledTextInset)
             .simultaneousGesture(textFontPinchGesture(), including: .all)
             .onAppear {
                 requestKeyboardFocus()
@@ -2693,6 +2848,60 @@ private struct PageInlineTextOverlay: View {
                     autosizeEditor(for: box.text, style: box.style, pageSize: pageSize)
                 }
             }
+    }
+
+    /// Drag handle rendered as a ZStack sibling (never inside TextEditor's UIKit tree).
+    /// DragGesture here fires reliably because UITextView's pan recognizer can't reach it.
+    private func dragHandle(pageSize: CGSize, boxFrame: CGRect) -> some View {
+        let handleH: CGFloat = max(20, 18 * effectiveTextScale)
+        // Position: sits flush against the top edge of the box, full width
+        let handleFrame = CGRect(
+            x: boxFrame.minX,
+            y: boxFrame.minY,
+            width: boxFrame.width,
+            height: handleH
+        )
+        return ZStack {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.accentInk.opacity(isDraggingBox ? 0.22 : 0.13))
+            Capsule()
+                .fill(Color.accentInk.opacity(isDraggingBox ? 0.7 : 0.4))
+                .frame(width: max(28, 36 * effectiveTextScale), height: max(3, 4 * effectiveTextScale))
+        }
+        .frame(width: handleFrame.width, height: handleFrame.height)
+        .offset(x: handleFrame.minX, y: handleFrame.minY)
+        .gesture(
+            DragGesture(minimumDistance: 4)
+                .updating($isDragGestureActive) { _, state, _ in
+                    state = true
+                }
+                .onChanged { value in
+                    guard !isTextPinchSizing else { return }
+                    onRequestIgnorePageTap()
+                    isDraggingBox = true
+                    if isFocused { isFocused = false }
+                    if dragStartFrame == nil {
+                        let start = transientFrame ?? modelFrame
+                        dragStartFrame = start
+                        transientFrame = start
+                        dragSampleCounter = 0
+                    }
+                    guard let start = dragStartFrame else { return }
+                    transientFrame = dragUpdatedFrame(from: start, translation: value.translation, pageSize: pageSize)
+                    dragSampleCounter += 1
+                }
+                .onEnded { _ in
+                    if isDraggingBox {
+                        commitTransientFrameIfNeeded()
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) {
+                            if isEditing { isFocused = true }
+                        }
+                    }
+                    dragStartFrame = nil
+                    isDraggingBox = false
+                    dragSampleCounter = 0
+                }
+        )
     }
 
     private var readOnlyContent: some View {
@@ -2986,12 +3195,17 @@ private struct PageInlineTextOverlay: View {
         return .system(size: size, weight: weight, design: .rounded)
     }
 
+    // Extra height to reserve for the drag handle at the top of the box when editing.
+    private var dragHandleReservedHeight: CGFloat { max(20, 18 * effectiveTextScale) }
+
     private func autosizeEditor(for text: String, style: NoteTextStyle, pageSize: CGSize) {
         guard pageSize.width > 0, pageSize.height > 0 else { return }
         let targetSize = recommendedEditorSize(for: text, style: style, pageSize: pageSize)
         let basePageSize = unscaledPageSize(for: pageSize)
         var normalizedWidth = Double(targetSize.width / max(basePageSize.width, 1))
-        var normalizedHeight = Double(targetSize.height / max(basePageSize.height, 1))
+        // Add handle height so the text area isn't cramped under it
+        let handleNormalized = Double(dragHandleReservedHeight / max(basePageSize.height, 1))
+        var normalizedHeight = Double(targetSize.height / max(basePageSize.height, 1)) + handleNormalized
 
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty {
@@ -3095,12 +3309,16 @@ private struct PageMediaBoxOverlay: View {
     let isLastPage: Bool
     let isTextMode: Bool
     let viewportState: CanvasViewportState
+    let pageWidth: CGFloat
+    let pageHeight: CGFloat
+    let pageOffsetY: CGFloat   // absolute Y of this page's top within the unified ZStack
     let onTapAtLocation: (CGPoint) -> Void
     let onDelete: () -> Void
     let onRequestIgnorePageTap: () -> Void
     let onFrameChange: (Double, Double, Double, Double, Double) -> Void
     let onDragActiveChanged: (Bool) -> Void
     let onEdgeScroll: ((CGFloat?) -> Void)?
+    let scrollOffsetY: () -> CGFloat
 
     @State private var transientFrame: OverlayBoxFrame?
     @State private var dragStartFrame: OverlayBoxFrame?
@@ -3111,6 +3329,7 @@ private struct PageMediaBoxOverlay: View {
     @State private var isPinchResizing = false
     @State private var isRotatingBox = false
     @State private var dragTouchOffset: CGSize?
+    @State private var dragStartScrollOffsetY: CGFloat = 0
 
     private var canManipulate: Bool {
         !isTextMode && (box.contentType == .image || box.isContainerStyle)
@@ -3131,79 +3350,88 @@ private struct PageMediaBoxOverlay: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
-            let pageSize = proxy.size
-            let pageGlobalFrame = proxy.frame(in: .global)
-            let currentFrame = transientFrame ?? modelFrame
-            let boxFrame = frame(for: currentFrame, in: pageSize)
+        // Positioned absolutely within the unified full-scroll ZStack.
+        // pageOffsetY is the top of this page in the scroll content.
+        // No GeometryReader needed — we have explicit page dimensions.
+        let pageSize = CGSize(width: pageWidth, height: pageHeight)
+        let currentFrame = transientFrame ?? modelFrame
+        let boxFrame = frame(for: currentFrame, in: pageSize)
+        // Absolute position: page top + box center within page
+        let absX = boxFrame.midX
+        let absY = pageOffsetY + boxFrame.midY
 
-            ZStack(alignment: .topTrailing) {
-                content
-                    .overlay { borderOverlay }
-                    .frame(width: boxFrame.width, height: boxFrame.height)
-                    .rotationEffect(.degrees(currentFrame.rotationDegrees))
-
-                if isEditing {
-                    deleteButton
-                        .offset(x: 10, y: -10)
-                }
+        ZStack {
+            content
+                .overlay { borderOverlay }
+                .frame(width: boxFrame.width, height: boxFrame.height)
+                .rotationEffect(.degrees(currentFrame.rotationDegrees))
+        }
+        .frame(width: boxFrame.width, height: boxFrame.height, alignment: .center)
+        .contentShape(Rectangle())
+        .gesture(
+            dragGestureAbsolute(pageSize: pageSize),
+            including: isEditing ? .all : .none
+        )
+        .simultaneousGesture(pinchResizeGesture(), including: isEditing ? .all : .none)
+        .simultaneousGesture(rotationGesture(), including: isEditing ? .all : .none)
+        .simultaneousGesture(
+            SpatialTapGesture().onEnded { value in
+                onTapAtLocation(value.location)
+            },
+            including: isEditing ? .gesture : .none
+        )
+        .animation(nil, value: transientFrame)
+        .position(x: absX, y: absY)
+        .overlay(alignment: .topLeading) {
+            if isEditing {
+                deleteButton
+                    .position(
+                        x: absX + boxFrame.width / 2 + 2,
+                        y: absY - boxFrame.height / 2 - 2
+                    )
+                    .zIndex(10)
+                    .allowsHitTesting(true)
             }
-            .frame(width: boxFrame.width, height: boxFrame.height, alignment: .center)
-            .position(x: boxFrame.midX, y: boxFrame.midY)
-            .contentShape(Rectangle())
-            .highPriorityGesture(
-                dragGesture(pageSize: pageSize, pageGlobalFrame: pageGlobalFrame, boxFrame: boxFrame),
-                including: isEditing ? .all : .none
-            )
-            .simultaneousGesture(pinchResizeGesture(), including: isEditing ? .all : .none)
-            .simultaneousGesture(rotationGesture(), including: isEditing ? .all : .none)
-            .simultaneousGesture(
-                SpatialTapGesture().onEnded { value in
-                    onTapAtLocation(value.location)
-                },
-                including: isEditing ? .gesture : .none
-            )
-            .animation(nil, value: transientFrame)
-            .onAppear {
-                refreshDecodedOverlayImage()
-            }
-            .onChange(of: box.imageData) { _, _ in
-                refreshDecodedOverlayImage()
-            }
-            .onChange(of: box.contentType) { _, _ in
-                refreshDecodedOverlayImage()
-            }
-            .onChange(of: isSelected) { _, selected in
-                if selected {
-                    transientFrame = nil
-                    dragStartFrame = nil
-                    pinchStartFrame = nil
-                    rotationStartFrame = nil
-                    isDraggingBox = false
-                    isPinchResizing = false
-                    isRotatingBox = false
-                } else {
-                    if !isDraggingBox {
-                        resetInteractionState()
-                    }
-                }
-            }
-            .onChange(of: isEditing) { _, editing in
-                if !editing && !isDraggingBox {
+        }
+        .onAppear {
+            refreshDecodedOverlayImage()
+        }
+        .onChange(of: box.imageData) { _, _ in
+            refreshDecodedOverlayImage()
+        }
+        .onChange(of: box.contentType) { _, _ in
+            refreshDecodedOverlayImage()
+        }
+        .onChange(of: isSelected) { _, selected in
+            if selected {
+                transientFrame = nil
+                dragStartFrame = nil
+                pinchStartFrame = nil
+                rotationStartFrame = nil
+                isDraggingBox = false
+                isPinchResizing = false
+                isRotatingBox = false
+            } else {
+                if !isDraggingBox {
                     resetInteractionState()
                 }
             }
-            .onChange(of: modelFrame) { _, _ in
-                guard let transientFrame else { return }
-                if isFrameClose(transientFrame, modelFrame) {
-                    self.transientFrame = nil
-                }
-            }
-            .onDisappear {
+        }
+        .onChange(of: isEditing) { _, editing in
+            if !editing && !isDraggingBox {
                 resetInteractionState()
             }
-            .allowsHitTesting(isEditing || isDraggingBox)
         }
+        .onChange(of: modelFrame) { _, _ in
+            guard let transientFrame else { return }
+            if isFrameClose(transientFrame, modelFrame) {
+                self.transientFrame = nil
+            }
+        }
+        .onDisappear {
+            resetInteractionState()
+        }
+        .allowsHitTesting(isEditing || isDraggingBox)
     }
 
     @ViewBuilder
@@ -3237,28 +3465,24 @@ private struct PageMediaBoxOverlay: View {
 
     private var deleteButton: some View {
         Button {
-            onRequestIgnorePageTap()
             onDelete()
         } label: {
             Image(systemName: "xmark")
-                .font(.system(size: 9, weight: .bold))
+                .font(.system(size: 10, weight: .bold))
                 .foregroundStyle(.white)
-                .frame(width: 20, height: 20)
-                .background(
-                    Circle()
-                        .fill(Color.accentInk)
-                )
-                .overlay(
-                    Circle()
-                        .stroke(Color.white.opacity(0.35), lineWidth: 0.8)
-                )
+                .frame(width: 26, height: 26)
+                .background(Circle().fill(Color.accentInk))
+                .overlay(Circle().stroke(Color.white.opacity(0.5), lineWidth: 1))
+                .padding(8)
+                .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .contentShape(Rectangle())
     }
 
-    private func dragGesture(pageSize: CGSize, pageGlobalFrame: CGRect, boxFrame: CGRect) -> some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .global)
+    // Drag using the local coordinate space of the unified ZStack.
+    // value.location is in the ZStack's space, where Y=0 is the top of page 0.
+    private func dragGestureAbsolute(pageSize: CGSize) -> some Gesture {
+        DragGesture(minimumDistance: 0, coordinateSpace: .named("unifiedMediaLayer"))
             .onChanged { value in
                 guard isEditing || isDraggingBox else { return }
                 let movedEnough = abs(value.translation.width) > 0.5 || abs(value.translation.height) > 0.5
@@ -3269,9 +3493,12 @@ private struct PageMediaBoxOverlay: View {
                     let start = transientFrame ?? modelFrame
                     dragStartFrame = start
                     transientFrame = start
+                    dragStartScrollOffsetY = scrollOffsetY()
+                    let imageCenterX = CGFloat(start.centerX) * pageSize.width
+                    let imageCenterY = pageOffsetY + CGFloat(start.centerY) * pageSize.height
                     dragTouchOffset = CGSize(
-                        width: value.startLocation.x - (pageGlobalFrame.minX + boxFrame.midX),
-                        height: value.startLocation.y - (pageGlobalFrame.minY + boxFrame.midY)
+                        width: value.startLocation.x - imageCenterX,
+                        height: value.startLocation.y - imageCenterY
                     )
                 }
 
@@ -3281,11 +3508,15 @@ private struct PageMediaBoxOverlay: View {
                 }
 
                 guard let startFrame = dragStartFrame else { return }
-                let nextFrame = dragUpdatedFrame(
+                let scrollDelta = scrollOffsetY() - dragStartScrollOffsetY
+                let compensatedLocation = CGPoint(
+                    x: value.location.x,
+                    y: value.location.y + scrollDelta
+                )
+                let nextFrame = dragUpdatedAbsolute(
                     from: startFrame,
-                    location: value.location,
+                    location: compensatedLocation,
                     pageSize: pageSize,
-                    pageGlobalFrame: pageGlobalFrame,
                     touchOffset: dragTouchOffset ?? .zero
                 )
                 var transaction = Transaction()
@@ -3293,16 +3524,15 @@ private struct PageMediaBoxOverlay: View {
                 withTransaction(transaction) {
                     transientFrame = nextFrame
                 }
-                onEdgeScroll?(value.location.y)
+                onEdgeScroll?(compensatedLocation.y)
             }
             .onEnded { value in
                 let movedEnough = abs(value.translation.width) > 0.5 || abs(value.translation.height) > 0.5
                 if movedEnough, let startFrame = dragStartFrame {
-                    let finalFrame = dragUpdatedFrame(
+                    let finalFrame = dragUpdatedAbsolute(
                         from: startFrame,
                         location: value.location,
                         pageSize: pageSize,
-                        pageGlobalFrame: pageGlobalFrame,
                         touchOffset: dragTouchOffset ?? .zero
                     )
                     transientFrame = finalFrame
@@ -3319,35 +3549,71 @@ private struct PageMediaBoxOverlay: View {
             }
     }
 
+    // Converts absolute location in the unified ZStack to normalized page coords.
+    private func dragUpdatedAbsolute(
+        from start: OverlayBoxFrame,
+        location: CGPoint,
+        pageSize: CGSize,
+        touchOffset: CGSize
+    ) -> OverlayBoxFrame {
+        let localX = location.x - touchOffset.width
+        let localY = location.y - touchOffset.height
+        // Convert absolute Y to page-local normalized
+        let normalizedX = Double(localX / max(pageSize.width, 1))
+        let normalizedY = Double((localY - pageOffsetY) / max(pageSize.height, 1))
+        let clamped = clampedCenter(
+            centerX: normalizedX,
+            centerY: normalizedY,
+            width: start.width,
+            height: start.height,
+            rotationDegrees: start.rotationDegrees
+        )
+        return OverlayBoxFrame(
+            centerX: clamped.x,
+            centerY: clamped.y,
+            width: start.width,
+            height: start.height,
+            rotationDegrees: start.rotationDegrees
+        )
+    }
+
     private func pinchResizeGesture() -> some Gesture {
-        MagnificationGesture()
+        MagnificationGesture(minimumScaleDelta: 0.01)
             .onChanged { value in
                 guard isEditing else { return }
-                isPinchResizing = true
-                if pinchStartFrame == nil {
+                let scale = Double(value)
+                guard scale > 0.05 else { return }
+                if !isPinchResizing {
                     onRequestIgnorePageTap()
-                    let start = transientFrame ?? modelFrame
-                    pinchStartFrame = start
-                    transientFrame = start
+                    isPinchResizing = true
+                    let base = transientFrame ?? modelFrame
+                    pinchStartFrame = base
+                    transientFrame = base
                 }
                 guard let start = pinchStartFrame else { return }
-                let scale = Double(value)
-                let newWidth = min(max(start.width * scale, 0.035), 0.92)
-                let newHeight = min(max(start.height * scale, 0.03), 0.86)
+                // Apply scale to start dimensions, but keep current rotation/center
+                // (which rotationGesture may be updating simultaneously).
+                let current = transientFrame ?? start
+                let newWidth  = min(max(start.width  * scale, 0.035), 0.92)
+                let newHeight = min(max(start.height * scale, 0.03),  0.86)
                 let clamped = clampedCenter(
-                    centerX: start.centerX,
-                    centerY: start.centerY,
+                    centerX: current.centerX,
+                    centerY: current.centerY,
                     width: newWidth,
                     height: newHeight,
-                    rotationDegrees: start.rotationDegrees
+                    rotationDegrees: current.rotationDegrees
                 )
-                transientFrame = OverlayBoxFrame(
-                    centerX: clamped.x,
-                    centerY: clamped.y,
-                    width: newWidth,
-                    height: newHeight,
-                    rotationDegrees: start.rotationDegrees
-                )
+                var t = Transaction()
+                t.animation = nil
+                withTransaction(t) {
+                    transientFrame = OverlayBoxFrame(
+                        centerX: clamped.x,
+                        centerY: clamped.y,
+                        width: newWidth,
+                        height: newHeight,
+                        rotationDegrees: current.rotationDegrees
+                    )
+                }
             }
             .onEnded { _ in
                 commitTransientFrameIfNeeded()
@@ -3358,50 +3624,51 @@ private struct PageMediaBoxOverlay: View {
     }
 
     private func rotationGesture() -> some Gesture {
-        RotationGesture()
+        RotationGesture(minimumAngleDelta: .degrees(1))
             .onChanged { value in
                 guard isEditing else { return }
-                isRotatingBox = true
-                if rotationStartFrame == nil {
+                if !isRotatingBox {
                     onRequestIgnorePageTap()
-                    let start = transientFrame ?? modelFrame
-                    rotationStartFrame = start
-                    transientFrame = start
+                    isRotatingBox = true
+                    // Capture the initial rotation and the gesture's starting angle
+                    // so we can compute a clean delta on every subsequent frame.
+                    let base = transientFrame ?? modelFrame
+                    rotationStartFrame = base
+                    transientFrame = base
                 }
                 guard let start = rotationStartFrame else { return }
-                let snapped = snappedRightAngle(start.rotationDegrees + value.degrees)
-                let clamped = clampedCenter(
-                    centerX: start.centerX,
-                    centerY: start.centerY,
-                    width: start.width,
-                    height: start.height,
-                    rotationDegrees: snapped
-                )
-                transientFrame = OverlayBoxFrame(
-                    centerX: clamped.x,
-                    centerY: clamped.y,
-                    width: start.width,
-                    height: start.height,
-                    rotationDegrees: snapped
-                )
+                let current = transientFrame ?? start
+                // value.degrees is cumulative from gesture start — apply delta
+                // from start angle directly, no snapping, no normalization.
+                let newAngle = start.rotationDegrees + value.degrees
+                var t = Transaction()
+                t.animation = nil
+                withTransaction(t) {
+                    transientFrame = OverlayBoxFrame(
+                        centerX: current.centerX,
+                        centerY: current.centerY,
+                        width: current.width,
+                        height: current.height,
+                        rotationDegrees: newAngle
+                    )
+                }
             }
             .onEnded { value in
                 guard let start = rotationStartFrame else { return }
-                let snapped = snappedRightAngle(start.rotationDegrees + value.degrees, threshold: 10)
-                let clamped = clampedCenter(
-                    centerX: start.centerX,
-                    centerY: start.centerY,
-                    width: start.width,
-                    height: start.height,
-                    rotationDegrees: snapped
-                )
-                transientFrame = OverlayBoxFrame(
-                    centerX: clamped.x,
-                    centerY: clamped.y,
-                    width: start.width,
-                    height: start.height,
-                    rotationDegrees: snapped
-                )
+                let current = transientFrame ?? start
+                // Snap to nearest 90° only on lift-off, loose 15° threshold.
+                let finalAngle = snappedRightAngle(start.rotationDegrees + value.degrees, threshold: 15)
+                var t = Transaction()
+                t.animation = nil
+                withTransaction(t) {
+                    transientFrame = OverlayBoxFrame(
+                        centerX: current.centerX,
+                        centerY: current.centerY,
+                        width: current.width,
+                        height: current.height,
+                        rotationDegrees: finalAngle
+                    )
+                }
                 commitTransientFrameIfNeeded()
                 onRequestIgnorePageTap()
                 rotationStartFrame = nil
@@ -3455,38 +3722,7 @@ private struct PageMediaBoxOverlay: View {
         return CGRect(x: center.x - (width / 2), y: center.y - (height / 2), width: width, height: height)
     }
 
-    private func dragUpdatedFrame(
-        from start: OverlayBoxFrame,
-        location: CGPoint,
-        pageSize: CGSize,
-        pageGlobalFrame: CGRect,
-        touchOffset: CGSize
-    ) -> OverlayBoxFrame {
-        let localCenterX = location.x - pageGlobalFrame.minX - touchOffset.width
-        let localCenterY = location.y - pageGlobalFrame.minY - touchOffset.height
-        let zoom = max(viewportState.zoomFactor, 1)
 
-        let baseCenterX = (localCenterX + viewportState.contentOffset.x - viewportState.contentOrigin.x) / zoom
-        let baseCenterY = (localCenterY + viewportState.contentOffset.y - viewportState.contentOrigin.y) / zoom
-
-        let normalizedCenterX = Double(baseCenterX / max(pageSize.width, 1))
-        let normalizedCenterY = Double(baseCenterY / max(pageSize.height, 1))
-
-        let clamped = clampedCenter(
-            centerX: normalizedCenterX,
-            centerY: normalizedCenterY,
-            width: start.width,
-            height: start.height,
-            rotationDegrees: start.rotationDegrees
-        )
-        return OverlayBoxFrame(
-            centerX: clamped.x,
-            centerY: clamped.y,
-            width: start.width,
-            height: start.height,
-            rotationDegrees: start.rotationDegrees
-        )
-    }
 
     private func commitTransientFrameIfNeeded() {
         guard let transient = transientFrame else { return }
@@ -3519,10 +3755,22 @@ private struct PageMediaBoxOverlay: View {
         rotationDegrees: Double
     ) -> (x: Double, y: Double) {
         let extents = rotatedHalfExtents(width: width, height: height, rotationDegrees: rotationDegrees)
-        let clampedX = min(max(centerX, extents.horizontal), 1 - extents.horizontal)
+        // When a large image is rotated ~45° extents can exceed 0.5, making the
+        // clamp range impossible (min > max) which yields NaN and hides the image.
+        let clampedX: Double
+        if extents.horizontal < 0.5 {
+            clampedX = min(max(centerX, extents.horizontal), 1.0 - extents.horizontal)
+        } else {
+            clampedX = max(0.0, min(centerX, 1.0))
+        }
         let minY = isFirstPage ? extents.vertical : -Double.infinity
         let maxY = isLastPage ? 1.0 - extents.vertical : Double.infinity
-        let clampedY = min(max(centerY, minY), maxY)
+        let clampedY: Double
+        if minY <= maxY {
+            clampedY = min(max(centerY, minY), maxY)
+        } else {
+            clampedY = centerY
+        }
         return (x: clampedX, y: clampedY)
     }
 
@@ -4263,6 +4511,10 @@ private final class ZoomablePaperCanvasHostView: UIView {
     private var lastBackgroundImageData = Data()
     private var lastLoggedPanEnabled: Bool?
     private var lastLoggedPinchEnabled: Bool?
+    /// CADisplayLink that publishes viewport state every frame during active gestures,
+    /// so the SwiftUI text-box overlay tracks zoom/scroll at display rate with no lag.
+    private var displayLink: CADisplayLink?
+    private var lastPublishedState: CanvasViewportState?
     var onZoomGestureBegan: (() -> Void)?
     var onZoomFactorChanged: ((CGFloat) -> Void)?
     var onViewportStateChanged: ((CanvasViewportState) -> Void)?
@@ -4287,6 +4539,40 @@ private final class ZoomablePaperCanvasHostView: UIView {
         super.didMoveToWindow()
         configureToolPickerIfNeeded()
         updateToolPickerVisibility()
+    }
+
+    // MARK: - Display-link driven viewport publishing
+
+    /// Start publishing viewport state at display rate. Called when a user gesture begins.
+    func startViewportDisplayLink() {
+        guard displayLink == nil else { return }
+        let link = CADisplayLink(target: self, selector: #selector(displayLinkTick))
+        link.add(to: .main, forMode: .common)
+        displayLink = link
+    }
+
+    /// Stop the display-link. Called when all gestures end.
+    func stopViewportDisplayLink() {
+        displayLink?.invalidate()
+        displayLink = nil
+        lastPublishedState = nil
+        // Publish one final authoritative state after gesture ends.
+        publishViewportState()
+    }
+
+    @objc private func displayLinkTick() {
+        // Read state directly from scroll view every frame — no @State batching delay.
+        let fitScale = max(scrollView.minimumZoomScale, 0.000_1)
+        let normalizedZoom = max(1, scrollView.zoomScale / fitScale)
+        let state = CanvasViewportState(
+            zoomFactor: normalizedZoom,
+            contentOffset: scrollView.contentOffset,
+            contentOrigin: contentView.frame.origin
+        )
+        // Only fire if something actually changed to avoid unnecessary SwiftUI renders.
+        guard state != lastPublishedState else { return }
+        lastPublishedState = state
+        onViewportStateChanged?(state)
     }
 
     private func configure() {
@@ -4557,6 +4843,7 @@ private final class ZoomablePaperCanvasHostView: UIView {
 
         func scrollViewWillBeginZooming(_ scrollView: UIScrollView, with view: UIView?) {
             hostView?.onZoomGestureBegan?()
+            hostView?.startViewportDisplayLink()
         }
 
         func viewForZooming(in scrollView: UIScrollView) -> UIView? {
@@ -4581,8 +4868,21 @@ private final class ZoomablePaperCanvasHostView: UIView {
             hostView?.publishViewportState()
         }
 
+        func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+            hostView?.startViewportDisplayLink()
+        }
+
+        func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+            if !decelerate { hostView?.stopViewportDisplayLink() }
+        }
+
+        func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
+            hostView?.stopViewportDisplayLink()
+        }
+
         func scrollViewDidEndZooming(_ scrollView: UIScrollView, with view: UIView?, atScale scale: CGFloat) {
             guard let hostView else { return }
+            hostView.stopViewportDisplayLink()
             guard !hostView.isApplyingProgrammaticZoom else { return }
             let fitScale = max(scrollView.minimumZoomScale, 0.000_1)
             let normalizedFactor = scale / fitScale
